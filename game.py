@@ -27,8 +27,6 @@ def dealign(piece, rotation):
         for x in range(-3,max([dot[1] for dot in piece[:-1]])):
             if layouts[piece[-1]][rotation] == [(dot[0]-y, dot[1]-x) for dot in piece[:-1]]:
                 return (y,x)
-            else:
-                print(str((y,x)) + " not")
 
 class Game:
     map = np.zeros((23,10))
@@ -43,8 +41,39 @@ class Game:
     b2b_comb = ""
 
     bag = []
-    bag_index = 0
+    pocket = []
 
+    pool_record = []
+
+    lost = False
+
+    collisions = 0
+
+    def reset(self, replay):
+        self.map = np.zeros((23,10))
+        self.hold_type = ""
+        self.current_piece = [(),(),(),(), ""]
+        self.score = 0
+        self.rot = 0
+        self.shift = (0,0)
+
+        self.prev_comb = ""
+        self.b2b = 0
+        self.b2b_comb = ""
+
+        self.generate_7bag()
+        self.generate_pocket()
+
+        self.lost = False
+
+        if replay:
+            if len(self.pool_record) >= 7:
+                self.bag = self.pool_record[:7]
+                self.pocket = self.pool_record[7:]
+            self.pool_record = self.bag[:]
+        else:
+            self.pool_record = self.bag[:]
+        self.collisions = 0
     def print_map(self):
         checkboard = True
         row_n = 0
@@ -66,7 +95,7 @@ class Game:
             checkboard = not checkboard
         print("Hold: " + self.hold_type)
         print("Score: " + str(self.score))
-        print("Bag: " + str(self.bag) + f" Next {self.bag[self.bag_index]}")
+        print("Bag: " + str(self.bag))
 
     def place_dots(self, piece):
         for dot in piece[:-1]:
@@ -85,23 +114,25 @@ class Game:
     def create_piece(self):
         if not self.bag:
             self.generate_7bag()
-        ptype = self.bag[self.bag_index]
+        if not self.pocket:
+            self.generate_pocket()
+        ptype = self.bag[0]
+        self.bag.pop(0)
+        self.bag.append(self.pocket[0])
+        self.pool_record.append(self.pocket[0])
+        self.pocket.pop(0)
         p = layouts[ptype][0]
         ap = align_to((0,3),p)
         for dot in ap:
             if self.map[dot] != 0:
-                print("< LOSS >")
                 return False
         self.current_piece = ap + [ptype]
         self.visible_current(True)
         self.rot = 0
-        self.bag_index += 1
-        if self.bag_index == 7:
-            self.generate_7bag()
-            self.bag_index = 0
         return True
 
     def move_left(self):
+        self.collisions = 0
         next = []
         self.visible_current(False)
         for y,x in self.current_piece[:-1]:
@@ -115,6 +146,7 @@ class Game:
         self.visible_current(True)
 
     def move_right(self):
+        self.collisions = 0
         next = []
         self.visible_current(False)
         for y,x in self.current_piece[:-1]:
@@ -128,6 +160,7 @@ class Game:
         self.visible_current(True)
 
     def soft_drop(self):
+        self.collisions = 0
         next = []
         self.visible_current(False)
         for y,x in self.current_piece[:-1]:
@@ -141,6 +174,7 @@ class Game:
         self.visible_current(True)
 
     def rotate(self):
+        self.collisions = 0
         self.visible_current(False)
         self.shift = dealign(self.current_piece, self.rot)
         for i in range(1,4):
@@ -148,23 +182,19 @@ class Game:
             rotation = self.rot + i
             while rotation > 3:
                 rotation -= 4
-            print(rotation)
-            print(self.current_piece)
-            print(self.shift)
             next = align_to(self.shift,layouts[self.current_piece[-1]][rotation]) + [self.current_piece[-1]]
 
-            hor_alright = False
-            ver_alright = False
-            for dot in next[:-1]:
-                if dot[1] < 0 and not hor_alright:
-                    next = [(y,x-dot[1]) for y,x in next[:-1]] + [self.current_piece[-1]]
-                    hor_alright = True
-                if dot[1] > 9 and not hor_alright:
-                    next = [(y,x-dot[1] + 9) for y,x in next[:-1]] + [self.current_piece[-1]]
-                    hor_alright = True
-                if dot[0] > 22 and not ver_alright:
-                    next = [(y-dot[0],x) for y,x in next[:-1]] + [self.current_piece[-1]]
-                    ver_alright = True
+            while not all([True if 0 <= x <= 9 and y <= 22 else False for y,x in next[:-1]]):
+                xs = [x for y,x in next[:-1]]
+                ys = [y for y,x in next[:-1]]
+
+                if min(xs) < 0:
+                    next = [(y,x-min(xs)) for y,x in next[:-1]] + [next[-1]]
+                if max(xs) > 9:
+                    next = [(y,x-max(xs)+9) for y,x in next[:-1]] + [next[-1]]
+                if max(ys) > 22:
+                    next = [(y-max(ys)+22,x) for y,x in next[:-1]] + [next[-1]]
+
             for dot in next[:-1]:
                 if self.map[dot]:
                     available = False
@@ -176,39 +206,67 @@ class Game:
         self.visible_current(True)
 
     def drop(self):
+        self.collisions = 0
         prev = []
         self.shift = dealign(self.current_piece, self.rot)
         while prev != self.current_piece:
             prev = self.current_piece
             self.soft_drop()
+            self.score += 1
         self.clear_lines()
-        self.create_piece()
+        if not self.create_piece():
+            self.lost = True
 
     def clear_lines(self):
         self.shift = dealign(self.current_piece, self.rot)
         if self.current_piece[-1] == "t":
             corners_coords = align_to(self.shift,[(0,0),(0,2),(2,0),(2,2)])
-            corners = [i for i in corners_coords if self.map[i] != 0 or i[1] < 0 or i[1] > 9]
+            corners = [i for i in corners_coords if i[0] > 22 or i[1] < 0 or i[1] > 9 or self.map[i] != 0]
             if len(corners) >= 3:
                 self.prev_comb = "tspin"
                 if len(corners) == 3:
                     if (corners == [i for i in align_to(self.shift,[(0,0),(2,0),(2,2)])
-                        if self.map[i] != 0 or i[1] < 0 or i[1] > 9]
+                        if i[1] < 0 or i[1] > 9 or self.map[i] != 0]
                         and (self.rot == 0 or self.rot == 1)) \
                             or (corners == [i for i in align_to(self.shift,[(0,2),(2,0),(2,2)])
-                                if self.map[i] != 0 or i[1] < 0 or i[1] > 9]
+                                if i[1] < 0 or i[1] > 9 or self.map[i] != 0]
                                 and (self.rot == 0 or self.rot == 3)) \
                             or (corners == [i for i in align_to(self.shift,[(0,0),(0,2),(2,2)])
-                                if self.map[i] != 0 or i[1] < 0 or i[1] > 9]
+                                if i[1] < 0 or i[1] > 9 or self.map[i] != 0]
                                 and (self.rot == 3 or self.rot == 2)) \
                             or (corners == [i for i in align_to(self.shift,[(0,0),(0,2),(2,0)])
-                                if self.map[i] != 0 or i[1] < 0 or i[1] > 9]
+                                if i[1] < 0 or i[1] > 9 or self.map[i] != 0]
                                 and (self.rot == 1 or self.rot == 2)):
-                        self.prev_comb = "minitspin"
+                            self.prev_comb = "minitspin"
             else:
                 self.prev_comb = ""
         else:
             self.prev_comb = ""
+
+        # collision count
+        for dot in self.current_piece[:-1]:
+            if dot[0] == 22:
+                self.collisions += 1
+            else:
+                if self.map[(dot[0]+1,dot[1])] and (dot[0]+1,dot[1]) not in self.current_piece:
+                    self.collisions += 1
+
+            if dot[0] > 0:
+                if self.map[(dot[0]-1,dot[1])] and (dot[0]-1,dot[1]) not in self.current_piece:
+                    self.collisions += 1
+
+            if dot[1] == 0:
+                self.collisions += 1
+            else:
+                if self.map[(dot[0],dot[1]-1)] and (dot[0],dot[1]-1) not in self.current_piece:
+                    self.collisions += 1
+
+            if dot[1] == 9:
+                self.collisions += 1
+            else:
+                if self.map[(dot[0],dot[1]+1)] and (dot[0],dot[1]+1) not in self.current_piece:
+                    self.collisions += 1
+
         cleared = 0
         row_n = 22
         while row_n > -1:
@@ -222,86 +280,94 @@ class Game:
         if cleared == 4:
             self.prev_comb = "tetris"
 
+        score_gained = 0
         if self.prev_comb == "" and cleared == 1:
-            self.score += 100
+            score_gained = 100
         elif self.prev_comb == "minitspin" and cleared == 1:
-            self.score += 200
+            score_gained = 200
         elif self.prev_comb == "" and cleared == 2:
-            self.score += 300
-        elif self.prev_comb == "minitspin" and cleared == 2 and self.b2b_comb != "tspin":
-            self.score += 400
-        elif self.prev_comb == "minitspin" and cleared == 2 and self.b2b_comb == "tspin":
-            self.score += 600
+            score_gained = 300
+        elif self.prev_comb == "minitspin" and cleared == 2:
+            score_gained = 400
         elif self.prev_comb == "" and cleared == 3:
-            self.score += 500
-        elif self.prev_comb == "tetris" and  self.b2b_comb != "tetris":
-            self.score += 800
-        elif self.prev_comb == "tspin" and cleared == 1 and self.b2b_comb != "tspin":
-            self.score += 800
-        elif self.prev_comb == "tspin" and cleared == 2 and self.b2b_comb != "tspin":
-            self.score += 1200
-        elif self.prev_comb == "tspin" and cleared == 1 and self.b2b_comb == "tspin":
-            self.score += 1200
-        elif self.prev_comb == "tetris" and self.b2b_comb == "tetris":
-            self.score += 1200
-        elif self.prev_comb == "tspin" and cleared == 3 and self.b2b_comb != "tspin":
-            self.score += 1600
-        elif self.prev_comb == "tspin" and cleared == 2 and self.b2b_comb == "tspin":
-            self.score += 1800
-        elif self.prev_comb == "tspin" and cleared == 3 and self.b2b_comb == "tspin":
-            self.score += 2400
+            score_gained = 500
+        elif self.prev_comb == "tetris":
+            score_gained = 800
+        elif self.prev_comb == "tspin" and cleared == 1:
+            score_gained = 800
+        elif self.prev_comb == "tspin" and cleared == 2:
+            score_gained = 1200
+        elif self.prev_comb == "tspin" and cleared == 3:
+            score_gained = 1600
 
         if cleared:
+            if self.b2b_comb == self.prev_comb and self.prev_comb != "":
+                score_gained *= 1.5
+                score_gained += 50*self.b2b
+                self.b2b += 1
+            else:
+                self.b2b = 0
             self.b2b_comb = "tspin" if self.prev_comb == "tspin" or self.prev_comb == "minitspin" else self.prev_comb
+        self.score += score_gained
 
     def generate_7bag(self):
         self.bag = []
-        standart = ["i","o","t","s","z","l","j"]
+        standard = ["i","o","t","s","z","l","j"]
         for i in range(7):
-            type = np.random.choice(standart)
-            standart.remove(type)
-            self.bag.append(type)
+            ptype = np.random.choice(standard)
+            standard.remove(ptype)
+            self.bag.append(ptype)
+
+    def generate_pocket(self):
+        self.pocket = []
+        standard = ["i","o","t","s","z","l","j"]
+        for i in range(7):
+            ptype = np.random.choice(standard)
+            standard.remove(ptype)
+            self.pocket.append(ptype)
 
     def swap_hold(self):
-        _bht =  self.hold_type
+        self.collisions = 0
+        _bht = self.hold_type
         self.visible_current(False)
         if _bht == "":
             self.hold_type = self.current_piece[-1]
-            if not self.bag:
-                self.generate_7bag()
-            ptype = self.bag[self.bag_index]
+            if not self.pocket:
+                self.generate_pocket()
+            ptype = self.bag[0]
+            self.bag.pop(0)
+            self.bag.append(self.pocket[0])
+            self.pool_record.append(self.pocket[0])
+            self.pocket.pop(0)
             p = layouts[ptype][0]
             ap = align_to((0,3),p)
             self.current_piece = ap + [ptype]
             self.visible_current(True)
             self.rot = 0
-            self.bag_index += 1
-            if self.bag_index == 7:
-                self.generate_7bag()
-                self.bag_index = 0
         else:
             self.hold_type = self.current_piece[-1]
             self.current_piece = align_to((0,3),layouts[_bht][0]) + [_bht]
             self.rot = 0
             self.visible_current(True)
+    def get_state(self):
+        state = []
+        standard = ["i", "o", "t", "s", "z", "l", "j", ""]
+        combs_standard = ["","tetris","tspin"]
+        self.visible_current(False)
+        state += [1 if i else 0 for i in self.map.flatten().tolist()]
+        self.visible_current(True)
 
+        tr_bag = [standard.index(i) for i in self.bag]
+        state += tr_bag
 
-# g = Game()
-# g.create_piece()
-# while True:
-#     g.print_map()
-#     move = input()
-#     if move == "left":
-#         g.move_left()
-#     if move == "right":
-#         g.move_right()
-#     if move == "soft":
-#         g.soft_drop()
-#     if move == "drop":
-#         g.drop()
-#     if move == "rot":
-#         g.rotate()
-#     if move == "swap":
-#         g.swap_hold()
-#     if move == "quit":
-#         break
+        flat_coords = []
+        for x, y in self.current_piece[:-1]:
+            flat_coords.append(x)
+            flat_coords.append(y)
+        state += flat_coords
+
+        state += [standard.index(self.hold_type)]
+
+        state += [combs_standard.index(self.b2b_comb)]
+
+        return np.array(state)
