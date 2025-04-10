@@ -1,14 +1,12 @@
 import torch.nn as nn
 import torch
 import torch.optim as optim
-import torch.nn.functional as F
 import numpy as np
 import random
 import colorama as cr
 
 from game import Game
 
-standard = ["i", "o", "t", "s", "z", "l", "j", ""]
 combs_standard = ["","tetris","tspin"]
 
 device = torch.device("cuda")
@@ -20,21 +18,33 @@ class TetrisModel(nn.Module):
         self.conv_net = nn.Sequential(
             nn.Conv2d(1, 128, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(2),
+            nn.InstanceNorm2d(128),
             nn.Conv2d(128, 256, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Flatten(), # channels * 11 * 5
+            nn.InstanceNorm2d(256),
+            nn.MaxPool2d(2),
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.InstanceNorm2d(512),
+            nn.Flatten(),
         )
 
         self.extra_net = nn.Sequential(
-            nn.Linear(17, 128),
+            nn.Linear(37, 128),
             nn.ReLU(),
+            nn.LayerNorm(128),
+            nn.Linear(128, 256),
+            nn.ReLU(),
+            nn.LayerNorm(256),
         )
 
-
         self.cross_interaction = nn.Sequential(
-            nn.Linear(256 * 11 * 5 + 128, 512),
+            nn.Linear(512*11*5 + 256, 1024),
             nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
             nn.Linear(512, 256),
             nn.ReLU(),
         )
@@ -42,8 +52,9 @@ class TetrisModel(nn.Module):
         self.output_layer = nn.Linear(256, 6)
 
     def forward(self, x):
-        batch_size = x.size(0)
-        board = x[:, :230].view(batch_size, 1, 23, 10)
+        if x.dim() == 3:
+            x = x.squeeze(1)
+        board = x[:, :230].view(x.size(0), 1, 23, 10)
         extra = x[:, 230:]
 
         board_features = self.conv_net(board)
@@ -59,84 +70,114 @@ class Agent:
         self.target_model = TetrisModel().to(device)
         self.target_model.load_state_dict(self.model.state_dict())
 
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
-        self.buffer = []
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.0005, weight_decay=1e-5)
+        self.loss_fn = nn.SmoothL1Loss()
         self.memory = []
-        self.memory_capacity = 10000
+        self.memory_capacity = 512
         self.batch_size = 128
-        self.gamma = 0.95
+        self.gamma = 0.99
+        self.tau = 0.005
 
-    def act(self, state, epsilon=0.25):
-        if np.random.random() < epsilon:
-            return np.random.randint(0, 5)
-        else:
+    def act(self, state, epsilon, training=True):
+        if isinstance(state, np.ndarray):
+            state = torch.FloatTensor(state).unsqueeze(0).to(device)
+
+        if not training:
+            self.model.eval()
             with torch.no_grad():
                 q_values = self.model(state)
-                return torch.argmax(q_values).item()
+            self.model.train()
+        else:
+            if np.random.random() < epsilon:
+                return np.random.randint(0, 6)
+            q_values = self.model(state)
 
-    def remember(self):
-        self.memory = self.memory + self.buffer
-        self.buffer = []
+        return torch.argmax(q_values).item()
+
+    def remember(self, transition):
+        transition = (
+            transition[0].cpu() if torch.is_tensor(transition[0]) else transition[0],
+            transition[1].cpu() if torch.is_tensor(transition[1]) else transition[1],
+            transition[2].cpu() if torch.is_tensor(transition[2]) else transition[2],
+            transition[3].cpu() if torch.is_tensor(transition[3]) else transition[3],
+            transition[4]
+        )
+        if len(self.memory) < self.memory_capacity:
+            self.memory.append(transition)
+        else:
+            idx = np.random.randint(0, self.memory_capacity)
+            self.memory[idx] = transition
 
     def replay(self):
-        random_batch = random.sample(self.memory, self.batch_size//2)
-        self.memory = self.memory + self.buffer
-        if len(self.memory) > self.memory_capacity:
-            self.memory = random.sample(self.memory, self.memory_capacity)
-        batch = random_batch + random.sample(self.buffer, self.batch_size//2)
-        states, actions, rewards, next_states = zip(*batch)
-        self.buffer = []
+        if len(self.memory) < self.batch_size:
+            return
+        batch = random.sample(self.memory, self.batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
 
-        states = torch.FloatTensor(states).to(device)
-        actions = torch.LongTensor(actions).to(device)
-        rewards = torch.FloatTensor(rewards).to(device)
-        next_states = torch.FloatTensor(next_states).to(device)
+        states = torch.FloatTensor(np.array([s.cpu().numpy() if torch.is_tensor(s) else s for s in states])).to(device)
+        actions = torch.LongTensor(np.array([a.cpu().numpy() if torch.is_tensor(a) else a for a in actions])).to(device)
+        rewards = torch.FloatTensor(np.array([r.cpu().numpy() if torch.is_tensor(r) else r for r in rewards])).to(device)
+        next_states = torch.FloatTensor(np.array([ns.cpu().numpy() if torch.is_tensor(ns) else ns for ns in next_states])).to(device)
+        dones = torch.FloatTensor(np.array(dones)).to(device)
 
         current_q = self.model(states).gather(1, actions.unsqueeze(1))
 
-        next_q = self.target_model(next_states).max(1)[0].detach()
-        target_q = rewards + self.gamma * next_q
+        with torch.no_grad():
+            next_q = self.target_model(next_states).max(1)[0]
+            target_q = rewards + (1 - dones) * self.gamma * next_q
 
-        loss = F.smooth_l1_loss(current_q.squeeze(), target_q)
+        loss = self.loss_fn(current_q.squeeze(), target_q)
 
         self.optimizer.zero_grad()
         loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
 
-    def update_target_model(self):
-        self.target_model.load_state_dict(self.model.state_dict())
+        self.soft_update_target_model()
+
+    def soft_update_target_model(self):
+        for target_param, param in zip(self.target_model.parameters(), self.model.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
 
 agent = Agent()
 #%%
-agent.model.load_state_dict(torch.load('model_weights.pt', map_location=torch.device(device)))
+agent.model.load_state_dict(torch.load('model.pt', map_location=torch.device(device)))
 #%%
-episode_count = 1500
-move_limit = 500
+episode_count = 500
+move_limit = 150
+empty_moves_penalty = -8
+reward_gamma = 0.9
 
 printer_cap = 10
-replay_times = 10
-epsilon_start = 0.75
+replay_times = 1
+autosave_cap = 20
+
+epsilon_start = 1.0
+epsilon_decay = 0.8 # multiplying
+epsilon_refresh_cap = 20
+
 epsilon = epsilon_start
-epsilon_decay = epsilon / replay_times
-
-autosave_cap = 200
-
+mean_score = 200
 scores = []
+best_score = 0
 g = Game()
 for episode in range(episode_count):
     if episode % replay_times != 0 and episode != 0:
         g.reset(True)
     else:
         g.reset(False)
-        epsilon = epsilon_start
     g.create_piece()
 
     moves = 0
-    trajectories = []
+    move_chain = []
 
-    while (moves < move_limit and not g.lost and move_limit) or (not move_limit and not g.lost):
+    while moves < move_limit and not g.lost:
         before_state = g.get_state()
+        before_state_tensor = torch.FloatTensor(before_state).to(device).unsqueeze(0)
         before_score = g.score
+        before_readiness = g.lines_readiness
+
         action = agent.act(torch.FloatTensor(before_state).to(device).unsqueeze(0), epsilon)
         match int(action):
             case 0:
@@ -147,48 +188,50 @@ for episode in range(episode_count):
                 g.soft_drop()
             case 3:
                 g.drop()
-                prev_positions = []
             case 4:
                 g.swap_hold()
             case 5:
                 g.rotate()
         moves += 1
-        score_difference = g.score - before_score
-        reward = -4
-        if score_difference > 0:
-            reward = score_difference - 15 + g.collisions
+        reward = empty_moves_penalty
+        if action == 3:
+            reward = (g.score - before_score) - 13 + g.collisions + (g.lines_readiness - before_readiness)*100
         if g.lost:
-            reward = -15
+            reward = -30
+        if moves == move_limit:
+            reward = -30
 
-        trajectories.append([before_state, action, reward, g.get_state()])
-    epsilon -= epsilon_decay
-
-    # дисконтирование
-    temp_trajectories = []
-    i = -1
-    local_gamma = 0.85
-    last_reward = 0
-    while -i <= len(trajectories):
-        tr = trajectories[i]
-        if tr[2] != -4:
-            last_reward = tr[2]
-            local_gamma = 0.9
+        if reward != empty_moves_penalty:
+            new_move_chain = []
+            local_gamma = reward_gamma
+            for trajectory in move_chain[::-1]:
+                new_move_chain.append((trajectory[0],trajectory[1],trajectory[2]+reward*local_gamma,
+                                           trajectory[3],trajectory[4]))
+                local_gamma *= reward_gamma
+            move_chain = []
+            new_move_chain = new_move_chain[::-1]
+            new_move_chain.append((before_state_tensor, action, reward, g.get_state(), g.lost))
+            for i in new_move_chain:
+                agent.remember(i)
+                # print(i[1],i[2])
+            agent.replay()
+            # print("----")
         else:
-            tr[2] = tr[2] + last_reward * local_gamma * 0.6
-            local_gamma *= local_gamma
-        i -= 1
-        temp_trajectories.append(tr)
-    trajectories = [tuple(tr) for tr in reversed(temp_trajectories)]
-    agent.buffer = trajectories
-
-    if len(agent.memory) >= agent.batch_size//2 and len(trajectories) >= agent.batch_size//2:
-        agent.replay()
-    else:
-        agent.remember()
+            move_chain.append((before_state_tensor, action, empty_moves_penalty, g.get_state(), g.lost))
 
     score = g.score
-    print(f"{moves} ходов | {cr.Fore.GREEN}{score} очков {cr.Fore.RESET}")
+    print(f"{moves} ходов | эпсилон {epsilon:.3f} | {cr.Fore.GREEN}{score} очков {cr.Fore.RESET}")
     scores.append(score)
+    if score > best_score:
+        g.print_map()
+        print(f"{cr.Fore.YELLOW}        Лучший за всё время{cr.Fore.RESET}")
+        best_score = score
+        torch.save(agent.model.state_dict(), 'best_score_model.pt')
+    elif score > best_score * 0.85:
+        g.print_map()
+        print(f"{cr.Fore.BLUE}Достаточно крут{cr.Fore.RESET}")
+
+    epsilon *= epsilon_decay
 
     if (episode+1) % printer_cap == 0 and episode != 0:
         g.print_map()
@@ -196,13 +239,13 @@ for episode in range(episode_count):
         mean_score = sum(scores) / len(scores)
         print(f"Средний счёт: {mean_score}")
         scores = []
-    if (episode+1) % 10 == 0:
-        agent.update_target_model()
     if (episode+1) % autosave_cap == 0:
-        torch.save(agent.model.state_dict(), 'model_weights.pt')
+        torch.save(agent.model.state_dict(), 'model.pt')
         print("AUTOSAVE")
+    if (episode+1) % epsilon_refresh_cap == 0:
+        epsilon = epsilon_start
 
 print("Done")
 #%%
 
-torch.save(agent.model.state_dict(), 'model_weights.pt')
+torch.save(agent.model.state_dict(), 'model.pt')

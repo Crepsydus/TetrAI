@@ -39,6 +39,7 @@ class Game:
     prev_comb = ""
     b2b = 0
     b2b_comb = ""
+    lines_readiness = 0
 
     bag = []
     pocket = []
@@ -48,6 +49,7 @@ class Game:
     lost = False
 
     collisions = 0
+    moves_memory = [6 for _ in range(20)]
 
     def reset(self, replay):
         self.map = np.zeros((23,10))
@@ -60,6 +62,7 @@ class Game:
         self.prev_comb = ""
         self.b2b = 0
         self.b2b_comb = ""
+        self.lines_readiness = 0
 
         self.generate_7bag()
         self.generate_pocket()
@@ -74,6 +77,7 @@ class Game:
         else:
             self.pool_record = self.bag[:]
         self.collisions = 0
+        self.moves_memory = [6 for _ in range(20)]
     def print_map(self):
         checkboard = True
         row_n = 0
@@ -144,6 +148,7 @@ class Game:
         next.append(self.current_piece[-1])
         self.current_piece = next
         self.visible_current(True)
+        self.stash(0)
 
     def move_right(self):
         self.collisions = 0
@@ -158,6 +163,7 @@ class Game:
         next.append(self.current_piece[-1])
         self.current_piece = next
         self.visible_current(True)
+        self.stash(1)
 
     def soft_drop(self):
         self.collisions = 0
@@ -172,6 +178,7 @@ class Game:
         next.append(self.current_piece[-1])
         self.current_piece = next
         self.visible_current(True)
+        self.stash(2)
 
     def rotate(self):
         self.collisions = 0
@@ -204,6 +211,7 @@ class Game:
                 self.rot = rotation
                 break
         self.visible_current(True)
+        self.stash(5)
 
     def drop(self):
         self.collisions = 0
@@ -216,6 +224,8 @@ class Game:
         self.clear_lines()
         if not self.create_piece():
             self.lost = True
+        self.stash(3)
+        self.scan_readiness()
 
     def clear_lines(self):
         self.shift = dealign(self.current_piece, self.rot)
@@ -349,6 +359,12 @@ class Game:
             self.current_piece = align_to((0,3),layouts[_bht][0]) + [_bht]
             self.rot = 0
             self.visible_current(True)
+        self.stash(4)
+
+    def stash(self, move):
+        self.moves_memory.insert(0,move)
+        self.moves_memory.pop(-1)
+
     def get_state(self):
         state = []
         standard = ["i", "o", "t", "s", "z", "l", "j", ""]
@@ -370,4 +386,17 @@ class Game:
 
         state += [combs_standard.index(self.b2b_comb)]
 
+        state += self.moves_memory
+
         return np.array(state)
+
+    def scan_readiness(self):
+        self.visible_current(False)
+        lines_started = 0
+        for y in range(0,23):
+            for x in range(0,10):
+                if self.map[y,x]:
+                    lines_started += 1
+                    break
+        self.lines_readiness = sum([bool(i) for i in self.map.flatten()]) / lines_started
+        self.visible_current(True)
