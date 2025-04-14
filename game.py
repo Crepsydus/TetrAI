@@ -369,7 +369,7 @@ class Game:
         state = []
         standard = ["i", "o", "t", "s", "z", "l", "j", ""]
         combs_standard = ["","tetris","tspin"]
-        self.visible_current(False)
+        # self.visible_current(False)
         state += [1 if i else 0 for i in self.map.flatten().tolist()]
         self.visible_current(True)
 
@@ -377,9 +377,9 @@ class Game:
         state += tr_bag
 
         flat_coords = []
-        for x, y in self.current_piece[:-1]:
-            flat_coords.append(x)
+        for y, x in self.current_piece[:-1]:
             flat_coords.append(y)
+            flat_coords.append(x)
         state += flat_coords
 
         state += [standard.index(self.hold_type)]
@@ -392,11 +392,14 @@ class Game:
 
     def scan_readiness(self):
         self.visible_current(False)
+        self.lines_readiness = sum([bool(i) for i in self.map.flatten()]) / self.scan_started_lines()
+        self.visible_current(True)
+
+    def scan_started_lines(self):
         lines_started = 0
         for y in range(0,23):
             for x in range(0,10):
                 if self.map[y,x]:
                     lines_started += 1
                     break
-        self.lines_readiness = sum([bool(i) for i in self.map.flatten()]) / lines_started
-        self.visible_current(True)
+        return lines_started
