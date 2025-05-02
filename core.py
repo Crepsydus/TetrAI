@@ -14,37 +14,50 @@ class TetrisModel(nn.Module):
         super().__init__()
 
         self.conv_net = nn.Sequential(
-            nn.Conv2d(1, 128, kernel_size=3, padding=1),
+            nn.Conv2d(1, 64, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.InstanceNorm2d(128),
+            nn.BatchNorm2d(64),
+
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm2d(128),
+
             nn.Conv2d(128, 256, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.InstanceNorm2d(256),
             nn.MaxPool2d(2),
-            nn.Conv2d(256, 512, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.InstanceNorm2d(512),
+
             nn.Flatten(),
+
+            nn.Linear(256 * 11 * 5, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3)
         )
 
         self.extra_net = nn.Sequential(
             nn.Linear(37, 128),
             nn.ReLU(),
             nn.LayerNorm(128),
+
             nn.Linear(128, 256),
             nn.ReLU(),
             nn.LayerNorm(256),
+
+            nn.Linear(256, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3)
         )
 
-        self.cross_interaction = nn.Sequential(
-            nn.Linear(512*11*5 + 256, 1024),
+        self.combined_net = nn.Sequential(
+            nn.Linear(512 + 512, 1024),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.LayerNorm(1024),
+
             nn.Linear(1024, 512),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.4),
+
             nn.Linear(512, 256),
-            nn.ReLU(),
+            nn.ReLU()
         )
 
         self.output_layer = nn.Linear(256, 6)
@@ -58,7 +71,7 @@ class TetrisModel(nn.Module):
         board_features = self.conv_net(board)
         extra_features = self.extra_net(extra)
         combined = torch.cat([board_features, extra_features], dim=1)
-        features = self.cross_interaction(combined)
+        features = self.combined_net(combined)
 
         return self.output_layer(features)
 
@@ -68,8 +81,8 @@ class Agent:
         self.target_model = TetrisModel().to(device)
         self.target_model.load_state_dict(self.model.state_dict())
 
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.0025, weight_decay=1e-5)
-        self.loss_fn = nn.SmoothL1Loss()
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=0.001, weight_decay=1e-4)
+        self.loss_fn = nn.HuberLoss()
         self.memory = []
         self.memory_capacity = 32768
         self.batch_size = 256
@@ -143,39 +156,44 @@ class Agent:
 agent = Agent()
 best_score = 0
 #%%
-agent.model = torch.load('model.pth', map_location=torch.device(device))
+agent.model = torch.load('model2.pth', map_location=torch.device(device))
 
 #%%
-agent.model = torch.load('best_score_model.pth', map_location=torch.device(device))
-
-#%%
-episode_count = 500 # 13m for 500
-move_limit = 150
+episode_count = 500 #
+move_limit = 0
 piece_move_limit = 50
 
-empty_moves_penalty = -7
-height_penalty = -16
+empty_moves_penalty = -5
+rm_penalty_starts = 5 # rm = repeating moves
+rm_penalty = -1
+lm_penalty_starts = 15 # lm = long moves (long interaction with the same piece)
+lm_penalty = -0.2
+height_penalty = -15
 collision_coef = 5
 readyness_coef = 2
 lines_coef = 3
 reward_gamma = 0.95
 
 printer_cap = 20
-coolness_coef = 0.71
-replay_times = 20
+replay_times = 2
 autosave_cap = 50
+autosave_path = "model2.pth"
 
-epsilon_start = 1
-epsilon_decay = 0.77 # multiplying
+coolness_threshold = 190
+coolness_raise_coef = 1.4 # raising threshold from avg score by multiplying to this
+
+epsilon_start = 0.8
+epsilon_decay = 0.75 # multiplying
+epsilon_edge = 0.04 # at which point should be considered as 0
 epsilon_refresh_cap = 20
 
 biases = [
-    2, # left
-    2, # right
-    3, # soft
+    1, # left
+    1, # right
+    1, # soft
     1, # drop
     1, # swap
-    6  # rotate
+    1  # rotate
 ]
 
 epsilon = epsilon_start
@@ -191,28 +209,30 @@ for episode in range(episode_count):
     moves = 0
     piece_moves = 0
     move_chain = []
+    move_counts = [0,0,0,0,0,0]
 
-    while (moves < move_limit and not g.lost and not piece_moves) or (piece_move_limit and piece_moves < piece_move_limit and not g.lost):
+    while (moves < move_limit and not g.lost and not piece_moves)\
+        or (piece_move_limit and piece_moves < piece_move_limit and not g.lost):
         before_state = g.get_state()
         before_state_tensor = torch.FloatTensor(before_state).to(device).unsqueeze(0)
         before_score = g.score
         before_readiness = g.lines_readiness
         before_started_lines = g.scan_started_lines()
 
-        action = agent.act(torch.FloatTensor(before_state).to(device).unsqueeze(0), epsilon)
-        match int(action):
+        action = int(agent.act(torch.FloatTensor(before_state).to(device).unsqueeze(0), epsilon))
+        match action:
             case 0: g.move_left()
             case 1: g.move_right()
             case 2: g.soft_drop()
             case 3:
                 g.drop()
                 piece_moves = 0
+                move_counts = [0,0,0,0,0,0]
             case 4: g.swap_hold()
             case 5: g.rotate()
         moves += 1
         piece_moves += 1
-
-        # empty_moves_penalty = -moves/10
+        move_counts[action] += 1
 
         reward = "empty"
 
@@ -241,12 +261,12 @@ for episode in range(episode_count):
             new_move_chain.append((before_state_tensor, action, reward, g.get_state(), g.lost))
             for i in new_move_chain:
                 agent.remember(i)
-                # print(i[1],i[2])
             agent.replay()
-            # print("----")
         else:
-            reward = empty_moves_penalty
-            move_chain.append((before_state_tensor, action, empty_moves_penalty, g.get_state(), g.lost))
+            reward = (empty_moves_penalty
+                      + lm_penalty*(0 if piece_moves < lm_penalty_starts else piece_moves-lm_penalty_starts)
+                      + rm_penalty*(0 if move_counts[action]<rm_penalty_starts else move_counts[action]-rm_penalty_starts))
+            move_chain.append((before_state_tensor, action, reward, g.get_state(), g.lost))
 
     score = g.score
     print(f"{moves} ходов | эпсилон {epsilon:.3f} | {cr.Fore.GREEN}{score} очков {cr.Fore.RESET}")
@@ -255,26 +275,25 @@ for episode in range(episode_count):
         g.print_map()
         print(f"{cr.Fore.YELLOW}        Лучший за всё время ({score}){cr.Fore.RESET}")
         best_score = score
-        # torch.save(agent.model, 'best_score_model.pth')
-    elif score > best_score * coolness_coef:
+    elif score > coolness_threshold:
         g.print_map()
         print(f"{cr.Fore.BLUE}Достаточно крут{cr.Fore.RESET}")
 
     epsilon *= epsilon_decay
+    if epsilon < epsilon_edge:
+        epsilon = 0
 
     if (episode+1) % printer_cap == 0 and episode != 0:
         g.print_map()
         print(f"Эпизод {episode}")
         mean_score = sum(scores) / len(scores)
         print(f"Средний счёт: {mean_score}")
+        coolness_threshold = mean_score * coolness_raise_coef
         scores = []
     if (episode+1) % autosave_cap == 0:
-        torch.save(agent.model, 'model.pth')
+        torch.save(agent.model, autosave_path)
         print("AUTOSAVE")
     if (episode+1) % epsilon_refresh_cap == 0:
         epsilon = epsilon_start
 
 print("Done")
-#%%
-
-torch.save(agent.model, 'model.pth')

@@ -84,7 +84,7 @@ class Game:
         print("---"*11)
         for row in self.map:
             row_n += 1
-            print((cl.Back.RED if row_n == 3 else cl.Fore.RESET) + "|", end="")
+            print((cl.Back.RED if row_n == 3 else cl.Back.RESET) + "|" + cl.Back.RESET, end="")
             for dot in row:
                 print((cl.Back.YELLOW if dot == 1 else
                        cl.Back.CYAN if dot == 2 else
@@ -95,7 +95,7 @@ class Game:
                        cl.Back.RED if dot == 7 else
                        cl.Back.BLACK if checkboard else cl.Back.RESET) + "   ", end="")
                 checkboard = not checkboard
-            print((cl.Back.RED if row_n == 3 else cl.Fore.RESET)+"|" + cl.Back.RESET)
+            print((cl.Back.RED if row_n == 3 else cl.Back.RESET) + "|" + cl.Back.RESET)
             checkboard = not checkboard
         print("Hold: " + self.hold_type)
         print("Score: " + str(self.score))
